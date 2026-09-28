@@ -1,128 +1,135 @@
-# 首版架构与安全边界
+# v0.1 架构与关键决策
 
-## 设计目标
+## 架构原则
 
-- 一台公网 Linux 服务器即可部署；
-- 家庭或办公网络不开放入站端口；
-- agent 安装后，通过一次性令牌完成注册；
-- 用户在 Web 页选择设备、本地地址和域名即可发布服务；
-- 控制面故障不应立即中断已建立的数据转发；
-- 首版优先可审计和可恢复，不追求多节点高可用。
-
-## 非目标
-
-v0.1 不做多租户 SaaS、计费、复杂组织权限、移动客户端、自研隧道协议、全球边缘网络、UDP、P2P 或 Kubernetes Operator。
+- 一台公网 Linux 主机即可运行；
+- 内网不开放入站端口，agent 主动出站；
+- 不自研传输协议，不 fork 全栈竞品；
+- 控制面、数据面、HTTPS 入口使用明确进程边界；
+- 单机版不引入 Redis、PostgreSQL、消息队列、SPA 或微服务；
+- 安全控制不能只存在于 Web UI，必须在 FRP/Caddy 执行点再次校验。
 
 ## 组件
 
-| 组件 | 职责 |
-| --- | --- |
-| miao-server | 单体控制面；登录、agent 注册、服务配置、期望状态、审计、健康检查 |
-| Web UI | 嵌入 miao-server；不单独部署前端服务器 |
-| SQLite | 保存用户、设备、服务、域名和审计事件 |
-| Caddy | 公开 HTTP/HTTPS 入口、证书和域名路由 |
-| FRP server | 隧道数据面；接收 agent 主动建立的连接 |
-| miao-agent | 内网守护进程；注册、拉取配置、监管 FRP client、上报状态 |
-| 本地服务 | NAS、Web 面板、SSH 或其他已授权服务 |
+| 组件 | 职责 | 失败影响 |
+| --- | --- | --- |
+| `miao-server` | 管理 UI/API、身份、期望状态、FRP 授权插件、Caddy 编排、诊断、审计 | 不能变更配置或授权新代理；现有数据连接尽量继续 |
+| SQLite | 单机状态源 | 控制面不可写；不允许退化为放行 |
+| Caddy | 80/443、TLS、Basic Auth、Host 路由 | 公网 HTTP 服务不可达 |
+| `frps` | 隧道 server 与 HTTP vhost | 所有隧道中断 |
+| `miao-agent` | 注册、配置收敛、目标探测、监管 frpc | 该设备服务不可达 |
+| `frpc` | 成熟数据面 client | 该设备隧道中断 |
 
-## 请求路径
+## 数据流
 
 ```mermaid
 flowchart TD
-    B["浏览器 / API 客户端"] --> C["Caddy :443"]
-    C --> F["FRP server"]
-    F --> A["miao-agent / FRP client"]
-    A --> L["内网目标服务"]
-    M["miao-server 控制面"] -. 配置与授权 .-> C
-    M -. 期望状态 .-> A
+    Visitor["访问者"] -->|HTTPS :443| Caddy
+    Admin["管理员"] -->|HTTPS :443| Caddy
+    Caddy -->|管理 Host| Server["miao-server"]
+    Caddy -->|服务 Host / 内部 HTTP| FRPS["frps vhost"]
+    FRPS -->|TLS tunnel :7000| FRPC["frpc"]
+    FRPC --> Target["内网 HTTP 服务"]
+    Agent["miao-agent"] -->|配置/心跳 HTTPS| Server
+    FRPS -. "Login/NewProxy 授权" .-> Server
 ```
 
-HTTP 公网访问经过 Caddy 终止 TLS。TCP 映射使用单独的受限端口池，不与管理面复用。
+管理请求与业务请求都经 Caddy，但使用不同 Host 和上游。Caddy 在公网终止 TLS，FRP 只接收内部明文 HTTP vhost 和 agent 的 TLS 隧道。
 
-## 注册流程
+## 控制流程
 
-1. 管理员在 Web UI 创建一个短期、一次性注册令牌；
-2. 用户在内网设备运行 agent，并只向公网网关发起出站连接；
-3. agent 用令牌换取独立设备身份；
-4. 服务端只保存令牌哈希，令牌使用后立即失效；
-5. agent 保存权限受限的设备凭据，后续可轮换或由管理员撤销；
-6. agent 拉取期望配置，校验后生成数据面配置并原子替换。
+### 注册
 
-## 配置模型
+1. 管理员创建短期一次性 token；
+2. agent 从 TTY/stdin 读取令牌，通过 HTTPS 换取独立设备 ID/token；令牌不进入命令行或 URL；
+3. 服务端只存 token 摘要；agent 以 0600 保存明文；
+4. agent 随后拉取空的期望配置并开始心跳；
+5. FRP 登录时插件再次验证同一设备状态。
 
-最小数据对象：
+### 发布服务
 
-- User：本地管理员账号；
-- Agent：一台内网设备及其身份、版本和在线状态；
-- Service：本地目标地址、协议、公开方式和状态；
-- Domain：域名、验证状态和证书状态；
-- Event：谁在何时创建、修改、启停或撤销了什么。
+1. 管理员创建草稿；
+2. 服务端规范化 target URL、slug 和访问模式；
+3. agent 验证目标属于本地 allowlist 并实际探测；
+4. 控制面验证 DNS 与通配子域名；
+5. generation 增加，agent 生成并验证 frpc 配置；
+6. FRP `NewProxy` 插件核对 agent/service/domain/type/generation；
+7. 控制面原子加载包含显式 Host 和 Basic Auth 的 Caddy 配置；
+8. 等待证书后执行外部回环检查，更新六层状态。
 
-SQLite 使用显式迁移。v0.1 不引入通用插件系统，也不为了未来多数据库预先设计仓储抽象。
+### 停用与撤销
 
-## 安全默认值
+- 停用服务：先从 Caddy 移除公网入口，再下发 agent 配置并关闭 FRP proxy；
+- 撤销 agent：标记 token 无效、拒绝后续 FRP 登录/配置 API，再停用其全部服务；
+- 操作可重试且幂等；任一步失败都显示部分收敛状态，不能只显示“已完成”。
 
-### 管理面
+## 配置一致性
 
-- 只监听 HTTPS；
-- 密码使用现代慢哈希；
-- 会话 Cookie 使用 Secure、HttpOnly、SameSite；
-- 登录与敏感操作限速；
-- Web 请求执行 CSRF 防护；
-- 公开测试前加入 TOTP 两步验证。
+SQLite 中的 desired state 是唯一事实源。每次改变资源都增加 `generation`：
 
-### agent
+- agent 只应用比当前新的 generation；
+- frpc 通过验证后才原子替换；
+- Caddy 使用由全部 enabled 服务生成的完整确定性配置，原子加载；
+- observation 单独保存，不反写期望状态；
+- 重启后 reconciler 比较 desired/observed 并收敛，不依赖一次性队列。
 
-- 每台 agent 独立凭据；
-- 凭据文件权限限制为当前服务账户；
-- 配置下发包含版本号，拒绝回滚到意外旧版本；
-- agent 只允许转发管理员明确配置的本机或局域网目标；
-- 不接受公网主动发来的管理命令。
+这样不需要 Redis 或消息队列，也能避免“数据库说已启用、实际路由不存在”的静默漂移。
 
-### 数据面
+## 可用性取舍
 
-- agent 到网关强制 TLS；
-- 控制连接与业务连接分离鉴权；
-- 公共 TCP 使用端口白名单、连接数和带宽上限；
-- 服务默认停用，发布动作必须显式执行；
-- 停用或撤销后由服务端和 agent 双向收敛状态。
+v0.1 的 FRP 插件只拦截 `Login` 和 `NewProxy`。不拦截每个 HTTP 访客连接，因此：
 
-### 日志
+- miao-server 短时重启时，已注册并运行的 proxy 仍可承接访问；
+- 新 agent 登录和新 proxy 在插件不可用时 fail closed；
+- 撤销不是瞬时强杀所有既有 TCP 流，控制面需主动关闭 proxy/agent；
+- 裸 TCP 的来源 IP allowlist 需要 `NewUserConn`，会带来额外可用性耦合，因此推迟到 v0.2。
 
-允许记录：时间、设备、服务、连接结果、字节数、错误类型。
+## Caddy 管理边界
 
-默认禁止记录：请求正文、Cookie、Authorization、完整查询参数、用户文件内容和私钥。
+- 不把 2019 或其他管理端口 publish 到宿主机；
+- 优先通过共享权限化 Unix socket；实现 spike 未通过时使用只含 Caddy 和 miao-server 的内部网络；
+- 只加载控制面生成的完整配置，不接收用户原始 Caddyfile；
+- 不启用无限制 On-Demand TLS；每个域名必须存在于 enabled service；
+- 配置失败时 Caddy 保留上一份工作配置，控制面记录 request ID 和脱敏错误。
 
-## 故障策略
+## Agent 本地边界
 
-- agent 断线后指数退避重连并加入随机抖动；
-- 控制面短时不可用时，已批准的数据面配置继续工作；
-- 配置更新采用“写临时文件、校验、原子替换、失败回滚”；
-- 连续失败达到阈值后保留最后可用配置并上报告警；
-- 证书续期失败提前告警，不在到期时才暴露问题。
+- 默认 target 仅允许 loopback 和安装时明确允许的 RFC1918/ULA CIDR；
+- 永久拒绝链路本地云元数据地址，除非未来有明确、单独且高风险的开关；
+- 不执行远程 shell，不下载运行任意插件；
+- 子进程使用固定二进制路径和参数数组，不经 shell 拼接；
+- agent 自身本地 API 只监听回环/Unix socket。
 
-## 技术决策记录
+## ADR
 
-### ADR-001：首版复用数据面
+### ADR-001：FRP 作为 v0.1 数据面
 
-状态：接受。
+状态：接受。成熟、活跃、Apache-2.0，并具有所需服务端授权钩子。通过独立进程和窄适配层控制依赖。
 
-复用 FRP；miao-server 和 miao-agent 只依赖一个最小适配接口。出现以下任一事实后再评估 rathole 或自研：无法实现所需隔离、严重安全缺口无法上游修复、真实压测不达标、依赖导致无法可靠升级。
+### ADR-002：v0.1 只支持 HTTP/HTTPS
 
-### ADR-002：控制面使用 Go 单体
+状态：接受。先完成安全入口、证书和诊断闭环。裸 TCP 需要来源控制、端口池与逐连接授权，移至 v0.2。
 
-状态：接受。
+### ADR-003：Caddy 显式域名配置，不开放任意签发
 
-一个进程内提供 API、Web UI、任务循环和 SQLite。首版不拆微服务、不引入消息队列。
+状态：接受。每次从 SQLite 全量渲染并原子加载。基域名使用 wildcard DNS，但证书仍按显式服务域名申请。
 
-### ADR-003：公网端用 Docker Compose
+### ADR-004：Go 单体 + 服务端 HTML + SQLite
 
-状态：接受。
+状态：接受。v0.1 只有单管理员和单网关，拆服务、SPA、多数据库都不会增加用户价值。
 
-Compose 同时编排 miao-server、FRP server 和 Caddy。Kubernetes 支持延后到有真实用户需求时。
+### ADR-005：三进程公网部署
 
-### ADR-004：v0.1 不做静默自更新
+状态：接受。`miao-server`、Caddy、frps 各自独立，Compose 固定版本；agent 与 frpc 在内网主机独立进程运行。
 
-状态：接受。
+### ADR-006：不静默自更新
 
-安装脚本可以检查版本，但升级必须由管理员明确执行。稳定版具备签名与回滚后再考虑自动更新。
+状态：接受。只做版本提示；管理员显式升级，验证失败自动回到最后可用配置。
+
+## 待 spike
+
+1. Caddy Unix socket 在官方容器内的权限与重启恢复；
+2. FRP 插件超时、frps 重启和 miao-server 重启下的准确行为；
+3. `frpc` 动态 API 与“生成配置 + verify + reload”两种方式的故障语义；
+4. go-sqlite3 的 amd64/arm64 可复现构建，若 CGO 成本过高再评估纯 Go 驱动；
+5. 绿联/群晖 Docker 网络模式下对宿主机和局域网目标的可达性。
